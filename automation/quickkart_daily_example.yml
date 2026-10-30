@@ -1,0 +1,192 @@
+# QuickKart | portfolio simulation, NOT actual store POS submissions.
+# Requires GitHub Actions repository secret: NEON_DATABASE_URL
+# Existing repository files:
+#   scripts/generate_cloud_store_files.py
+#   scripts/run_daily_quality_pipeline.py
+name: QuickKart Daily Cloud Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: "Optional report date (YYYY-MM-DD). Blank means yesterday in IST."
+        required: false
+        type: string
+  schedule:
+    # Multiple independent chances before 10 AM IST Power BI refresh.
+    # GitHub schedule is best-effort: executions can be delayed/skipped.
+    - cron: '13 0 * * *'   # 05:43 IST: primary, yesterday
+    - cron: '23 1 * * *'   # 06:53 IST: catch up day-before-yesterday
+    - cron: '31 2 * * *'   # 08:01 IST: fallback, yesterday
+    - cron: '41 3 * * *'   # 09:11 IST: fallback, yesterday
+    - cron: '17 6 * * *'   # 11:47 IST: late fallback, yesterday
+
+permissions:
+  contents: read
+
+# Multiple triggers must not write a daily batch concurrently.
+concurrency:
+  group: quickkart-neon-daily-load
+  cancel-in-progress: false
+
+jobs:
+  quality_gate_and_neon_load:
+    name: Generate, validate, load to Neon
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      REPORT_DATE: ${{ inputs.report_date }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PostgreSQL driver
+        run: python -m pip install --disable-pip-version-check psycopg2-binary==2.9.10
+
+      - name: Check required secret (do not print it)
+        shell: bash
+        run: |
+          if [ -z "$NEON_DATABASE_URL" ]; then
+            echo "ERROR: Set NEON_DATABASE_URL in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Resolve report date in IST and perform one-day catch-up
+        shell: bash
+        env:
+          SCHEDULE_EXPRESSION: ${{ github.event.schedule }}
+        run: |
+          if [ -z "${REPORT_DATE:-}" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$SCHEDULE_EXPRESSION" = "23 1 * * *" ]; then
+              REPORT_DATE="$(TZ=Asia/Kolkata date -d '2 days ago' +%F)"
+            else
+              REPORT_DATE="$(TZ=Asia/Kolkata date -d 'yesterday' +%F)"
+            fi
+          fi
+          python -c 'import os; from datetime import date; date.fromisoformat(os.environ["REPORT_DATE"])'
+          echo "REPORT_DATE=$REPORT_DATE" >> "$GITHUB_ENV"
+          echo "Simulated report date: $REPORT_DATE"
+
+      - name: Generate 50 simulated store files from Neon
+        shell: bash
+        run: python scripts/generate_cloud_store_files.py --date "$REPORT_DATE"
+
+      - name: Run original strict CSV quality gate
+        shell: bash
+        run: python scripts/run_daily_quality_pipeline.py --date "$REPORT_DATE"
+
+      - name: Publish only PASS batch to Neon (transactional, rerun-safe)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+
+          import psycopg2
+          from psycopg2.extras import execute_values
+
+          ist = timezone(timedelta(hours=5, minutes=30))
+          report_date = date.fromisoformat(os.environ['REPORT_DATE'])
+          day = report_date.isoformat()
+          base = Path.cwd()
+          status_path = base / '04_Automation_Logs' / f'{day}_status.json'
+          approved_path = base / '03_Approved_Output' / f'Approved_Sales_{day}.csv'
+
+          if not status_path.is_file() or not approved_path.is_file():
+              raise SystemExit('BLOCKED: expected QA status or approved CSV is missing; Neon unchanged.')
+
+          status = json.loads(status_path.read_text(encoding='utf-8'))
+          must_match = {
+              'report_date': day,
+              'status': 'PASS',
+              'issue_count': 0,
+              'expected_store_files': 50,
+              'received_store_files': 50,
+              'missing_files': 0,
+              'unexpected_files': 0,
+              'approved_transaction_rows': 1500,
+          }
+          for key, expected in must_match.items():
+              if status.get(key) != expected:
+                  raise SystemExit(f'BLOCKED: QA {key} differs from expected value; Neon unchanged.')
+          if not status.get('approved_csv') or Path(status['approved_csv']).resolve() != approved_path.resolve():
+              raise SystemExit('BLOCKED: status JSON does not identify the approved CSV; Neon unchanged.')
+
+          required = {'Sale_ID', 'Date', 'Store_ID', 'Product_ID', 'Units', 'Source_File'}
+          rows, sale_ids = [], set()
+          with approved_path.open('r', encoding='utf-8-sig', newline='') as source:
+              reader = csv.DictReader(source)
+              if not required.issubset(set(reader.fieldnames or [])):
+                  raise SystemExit('BLOCKED: incorrect approved CSV schema; Neon unchanged.')
+              for line_num, record in enumerate(reader, start=2):
+                  def positive_int(field):
+                      val = (record.get(field) or '').strip()
+                      if not re.fullmatch(r'[0-9]+', val) or int(val) <= 0:
+                          raise ValueError(f'Line {line_num}: invalid {field}')
+                      return int(val)
+
+                  sale_id = positive_int('Sale_ID')
+                  store_id = positive_int('Store_ID')
+                  product_id = positive_int('Product_ID')
+                  units = positive_int('Units')
+                  if (record.get('Date') or '').strip() != day:
+                      raise ValueError(f'Line {line_num}: incorrect sale date')
+                  if (record.get('Source_File') or '').strip() != f'POS_{day}_S{store_id:03d}.csv':
+                      raise ValueError(f'Line {line_num}: incorrect source filename')
+                  if sale_id in sale_ids:
+                      raise ValueError(f'Line {line_num}: duplicate Sale_ID')
+                  sale_ids.add(sale_id)
+                  rows.append((report_date, sale_id, report_date, store_id, product_id, units))
+
+          if len(rows) != 1500 or len(sale_ids) != 1500:
+              raise SystemExit('BLOCKED: approved CSV must contain 1,500 distinct records; Neon unchanged.')
+          expected_units = sum(r[5] for r in rows)
+
+          # Atomic replacement: errors roll back deletion AND insertion together.
+          conn = psycopg2.connect(os.environ['NEON_DATABASE_URL'], sslmode='require', connect_timeout=30)
+          try:
+              with conn:
+                  with conn.cursor() as cur:
+                      cur.execute('DELETE FROM daily.approved_sales WHERE report_date = %s', (report_date,))
+                      execute_values(cur, '''
+                          INSERT INTO daily.approved_sales
+                          (report_date, sale_id, sale_date, store_id, product_id, units)
+                          VALUES %s
+                      ''', rows, page_size=500)
+                      cur.execute('''
+                          SELECT COUNT(*), COUNT(DISTINCT sale_id), COALESCE(SUM(units), 0)
+                          FROM daily.approved_sales WHERE report_date = %s
+                      ''', (report_date,))
+                      got_count, got_unique, got_units = cur.fetchone()
+                      if (got_count, got_unique, int(got_units)) != (1500, 1500, expected_units):
+                          raise RuntimeError('Neon row/unit reconciliation failed: transaction rolled back')
+          finally:
+              conn.close()
+          print(f'PASS: Neon daily.approved_sales | Date {day} | 1500 simulated rows | {expected_units} units')
+          print('Historical and other daily batches were not altered.')
+          PY
+
+      - name: Keep simulated POS files, approved output and QA evidence for 7 days
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickkart-quality-logs-${{ github.run_id }}
+          path: |
+            02_Daily_Input/**/*.csv
+            03_Approved_Output/*.csv
+            04_Automation_Logs/*.json
+            04_Automation_Logs/*.log
+            04_Automation_Logs/*.csv
+          if-no-files-found: ignore
+          retention-days: 7
